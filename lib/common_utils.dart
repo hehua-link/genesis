@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
@@ -12,7 +14,32 @@ enum CpuArch {
   unknown,
 }
 
+enum ServiceStatusCode {
+  successRunning,
+  alreadyExists,
+  otherError,
+}
+
+class ServiceStatus {
+  final int? pid;
+  final ServiceStatusCode code;
+  String? description;
+
+  ServiceStatus({required this.pid, required this.code, this.description});
+}
+
+class CommandResult {
+  final bool isSuccess;
+  final dynamic output;
+
+  const CommandResult({required this.isSuccess, required this.output});
+}
+
 class CommonUtils {
+  // Pid or null, null indicates the command execution failure.
+  static final StreamController<ServiceStatus> _frpcAsyncExecStream =
+      StreamController.broadcast();
+
   static CpuArch checkCpuArch() {
     if (Platform.isWindows) {
       String? arch =
@@ -83,6 +110,27 @@ class CommonUtils {
     return envDir.path;
   }
 
+  static Future<bool> checkEspDeviceDriverInstallation(
+      {required String? baseDir}) async {
+    if (baseDir == null) {
+      return false;
+    }
+
+    final driverDir = Directory(path.join(baseDir, 'cp210x'));
+    if (!(await driverDir.exists())) {
+      return false;
+    }
+
+    final result = await _runProcess('pnputil', ['/enum-drivers']);
+    if (result.isSuccess &&
+        result.output is String &&
+        (result.output as String).contains('slabvcp.inf')) {
+      return true;
+    }
+
+    return false;
+  }
+
   static Future<bool> checkEsptoolInstallation(
       {required String? baseDir}) async {
     if (baseDir == null) {
@@ -97,7 +145,8 @@ class CommonUtils {
       return false;
     }
 
-    return await _runProcess(pythonExecPath, [espRfcServerScriptPath, '-h']);
+    return (await _runProcess(pythonExecPath, [espRfcServerScriptPath, '-h']))
+        .isSuccess;
   }
 
   static Future<bool> checkFrpInstallation({required String? baseDir}) async {
@@ -111,7 +160,7 @@ class CommonUtils {
       return false;
     }
 
-    return await _runProcess(file.path, ['--version']);
+    return (await _runProcess(file.path, ['--version'])).isSuccess;
   }
 
   static Future<bool> checkPythonInstallation(
@@ -125,7 +174,60 @@ class CommonUtils {
       return false;
     }
 
-    return await _runProcess(file.path, ['--version']);
+    return (await _runProcess(file.path, ['--version'])).isSuccess;
+  }
+
+  ///
+  /// Return the cp210x driver directory.
+  /// TODO: If user not install driver, prompt user to install
+  ///       using this function, after user installed successfully,
+  ///       prompt user to click driver installed button,
+  ///       then continue the normal components installation
+  ///       procedure.
+  ///
+  static Future<String?> installEspDeviceDriver(
+      {required CpuArch cpuArch, required String baseDir}) async {
+    final targetDir = await createDirectory(baseDir: baseDir, name: 'cp210x');
+    if (targetDir == null) {
+      return null;
+    }
+
+    if (await checkEspDeviceDriverInstallation(baseDir: baseDir)) {
+      return targetDir;
+    }
+
+    // TODO: Download from genesis backend.
+    const downloadUrl =
+        'https://www.silabs.com/documents/public/software/CP210x_Windows_Drivers.zip';
+    if (!(await downloadFile(downloadUrl, baseDir, 'cp210x.zip'))) {
+      return null;
+    }
+
+    // Create unzipped directory and Unzip.
+    final sourceZipFilePath = path.join(baseDir, 'cp210x.zip');
+    if (!(await unzipFile(sourceZipFilePath, targetDir))) {
+      return null;
+    }
+    // Delete the zip file.
+    await deleteFileOrDirectory(path: sourceZipFilePath);
+
+    String driverInstaller = 'CP210xVCPInstaller_x64.exe';
+    switch (cpuArch) {
+      case CpuArch.amd64:
+      case CpuArch.arm64:
+        break;
+      default:
+        return null;
+    }
+
+    String installerPath = path.join(targetDir, driverInstaller);
+    //final process = await _runProcessAsync(installerPath, []);
+    //final stdoutSub = process.stdout.transform(utf8.decoder).listen((data) {
+    //  print('data ==== $data');
+    //});
+    final result = await _runInstaller(installerPath, runAsAdmin: true);
+
+    return targetDir;
   }
 
   ///
@@ -161,34 +263,97 @@ class CommonUtils {
     final esptoolBaseDir = path.join(baseDir, 'esptool', 'esptool-master');
     final setupScriptPath = path.join(esptoolBaseDir, 'setup.py');
     if (!(await _runProcess(pythonExecPath, [setupScriptPath, 'install'],
-        workingDir: esptoolBaseDir))) {
+            workingDir: esptoolBaseDir))
+        .isSuccess) {
       return null;
     }
 
     // Ensure the esp rfc server is available.
     final espRfcServerScriptPath = path.join(
         baseDir, 'esptool', 'esptool-master', 'esp_rfc2217_server.py');
-    if (!(await _runProcess(pythonExecPath, [espRfcServerScriptPath, '-h']))) {
+    if (!(await _runProcess(pythonExecPath, [espRfcServerScriptPath, '-h']))
+        .isSuccess) {
       return null;
     }
 
     return targetDir;
   }
 
-  static Future<bool> startFrpc({required String baseDir}) async {
+  static Future<ServiceStatus?> startEspRfcServer(
+      {required String baseDir}) async {
+    if (!(await checkEsptoolInstallation(baseDir: baseDir))) {
+      return null;
+    }
+
+    final serverScriptPath = path.join(
+        baseDir, 'esptool', 'esptool-master', 'esp_rfc2217_server.py');
+
+    final process =
+        await _runProcessAsync(serverScriptPath, ['-p', '7077', '/dev']);
+    final stdoutSub = process.stdout.transform(utf8.decoder).listen((data) {
+      if (data.contains('error')) {
+        if (data.contains('already exists')) {
+          _frpcAsyncExecStream.add(
+              ServiceStatus(pid: null, code: ServiceStatusCode.alreadyExists));
+        } else {
+          _frpcAsyncExecStream.add(ServiceStatus(
+              pid: null,
+              code: ServiceStatusCode.otherError,
+              description: data));
+        }
+      } else if (data.contains('start proxy success')) {
+        _frpcAsyncExecStream.add(ServiceStatus(
+            pid: process.pid, code: ServiceStatusCode.successRunning));
+      }
+    });
+
+    final serviceStatus = await _frpcAsyncExecStream.stream.first;
+    // Stop subscription.
+    stdoutSub.cancel();
+    if (serviceStatus.pid == null) {
+      process.kill();
+    }
+
+    return serviceStatus;
+  }
+
+  static Future<ServiceStatus?> startFrpc({required String baseDir}) async {
     if (!(await checkFrpInstallation(baseDir: baseDir))) {
-      return false;
+      return null;
     }
 
     final frpcPath =
         path.join(baseDir, 'frp', 'frp_0.60.0_windows_amd64', 'frpc.exe');
     final frpcConfigFilePath =
         path.join(baseDir, 'frp', 'frp_0.60.0_windows_amd64', 'frpc.toml');
-    if (!(await _runProcess(frpcPath, ['-c', frpcConfigFilePath]))) {
-      return false;
+
+    final process =
+        await _runProcessAsync(frpcPath, ['-c', frpcConfigFilePath]);
+    final stdoutSub = process.stdout.transform(utf8.decoder).listen((data) {
+      if (data.contains('error')) {
+        if (data.contains('already exists')) {
+          _frpcAsyncExecStream.add(
+              ServiceStatus(pid: null, code: ServiceStatusCode.alreadyExists));
+        } else {
+          _frpcAsyncExecStream.add(ServiceStatus(
+              pid: null,
+              code: ServiceStatusCode.otherError,
+              description: data));
+        }
+      } else if (data.contains('start proxy success')) {
+        _frpcAsyncExecStream.add(ServiceStatus(
+            pid: process.pid, code: ServiceStatusCode.successRunning));
+      }
+    });
+
+    final serviceStatus = await _frpcAsyncExecStream.stream.first;
+    // Stop subscription.
+    stdoutSub.cancel();
+    if (serviceStatus.pid == null) {
+      process.kill();
     }
 
-    return true;
+    return serviceStatus;
   }
 
   ///
@@ -234,8 +399,9 @@ class CommonUtils {
 
     // Ensure frp is available.
     if (!(await _runProcess(
-        path.join(targetDir, 'frp_0.60.0_windows_amd64', 'frpc.exe'),
-        ['--version']))) {
+            path.join(targetDir, 'frp_0.60.0_windows_amd64', 'frpc.exe'),
+            ['--version']))
+        .isSuccess) {
       return null;
     }
 
@@ -299,18 +465,21 @@ class CommonUtils {
     }
     // Install pip.
     if (!(await _runProcess(path.join(targetDir, 'python.exe'),
-        [path.join(baseDir, 'get_pip.py')]))) {
+            [path.join(baseDir, 'get_pip.py')]))
+        .isSuccess) {
       return null;
     }
     // Ensure the pip is available.
     if (!(await _runProcess(
-        path.join(targetDir, 'python.exe'), ['-m', 'pip', '--version']))) {
+            path.join(targetDir, 'python.exe'), ['-m', 'pip', '--version']))
+        .isSuccess) {
       return null;
     }
 
     // Install Setuptools.
     if (!(await _runProcess(path.join(targetDir, 'python.exe'),
-        ['-m', 'pip', 'install', 'setuptools']))) {
+            ['-m', 'pip', 'install', 'setuptools']))
+        .isSuccess) {
       return null;
     }
 
@@ -368,15 +537,60 @@ class CommonUtils {
     }
   }
 
-  static Future<bool> _runProcess(String command, List<String> args,
+  static Future<CommandResult> _runInstaller(String installerPath,
+      {bool runAsAdmin = false}) async {
+    try {
+      var result = runAsAdmin
+          //? await Process.run(
+          //   'runas', ['/user:Administrator', 'cmd /c $installerPath'])
+          ? await Process.run(
+              'powershell', ['Start-Process', installerPath, '-Verb', 'runAs'])
+          : await Process.run(installerPath, []);
+      return CommandResult(isSuccess: result.exitCode == 0, output: null);
+    } catch (e) {
+      return const CommandResult(isSuccess: false, output: null);
+    }
+  }
+
+  static Future<CommandResult> _runProcess(String command, List<String> args,
       {String? workingDir}) async {
     try {
       var result = workingDir == null
           ? await Process.run(command, args)
           : await Process.run(command, args, workingDirectory: workingDir);
-      return result.exitCode == 0;
+      return CommandResult(
+          isSuccess: result.exitCode == 0, output: result.stdout);
     } catch (e) {
-      return false;
+      return const CommandResult(isSuccess: false, output: null);
     }
+  }
+
+  static Future<Process> _runProcessAsync(String command, List<String> args,
+      {String? workingDir}) async {
+    return workingDir == null
+        ? await Process.start(command, args)
+        : await Process.start(command, args, workingDirectory: workingDir);
+
+    //? Process.run(command, args).then((result) {
+    //    _commandAsyncExecStream.add(result);
+    //  }).onError((e, _) {
+    //    print(e.toString());
+    //    _commandAsyncExecStream.add(null);
+    //  }).catchError((e) {
+    //    print(e.toString());
+    //    _commandAsyncExecStream.add(null);
+    //  }).whenComplete(() {
+    //    print('dsdsadasadsads');
+    //  })
+    //: Process.run(command, args, workingDirectory: workingDir)
+    //    .then((result) {
+    //    _commandAsyncExecStream.add(result);
+    //  }).onError((e, _) {
+    //    print(e.toString());
+    //    _commandAsyncExecStream.add(null);
+    //  }).catchError((e) {
+    //    print(e.toString());
+    //    _commandAsyncExecStream.add(null);
+    //  });
   }
 }

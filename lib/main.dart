@@ -44,15 +44,20 @@ class _MyHomePageState extends State<MyHomePage> {
 
   bool _isCpuArchSupported = true;
   bool _isEnvDirCreated = true;
+  bool _isEspDeviceDriverInstalled = true;
   bool _isPythonInstalled = true;
   bool _isEsptoolInstalled = true;
   bool _isFrpInstalled = true;
 
   CpuArch _cpuArch = CpuArch.unknown;
 
+  String? _espDeviceDriverInstallDir;
   String? _pythonInstallDir;
   String? _esptoolInstallDir;
   String? _frpInstallDir;
+
+  int? _frpcPid;
+  int? _espRfcServerPid;
 
   bool _isEnvCreationStarted = false;
 
@@ -104,6 +109,17 @@ class _MyHomePageState extends State<MyHomePage> {
     return supported;
   }
 
+  Future<bool> _checkAndInstallEspDeviceDriver() async {
+    String? installPath = await CommonUtils.installEspDeviceDriver(
+        cpuArch: _cpuArch, baseDir: _envDir!);
+    setState(() {
+      _isEspDeviceDriverInstalled = installPath != null;
+      _espDeviceDriverInstallDir = installPath;
+    });
+
+    return installPath != null;
+  }
+
   ///
   /// Check whether python3 is installed, if not execute installation.
   ///
@@ -150,6 +166,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     if (_checkCpuArch() &&
         await _checkAndCreateEnvDirectory() &&
+        await _checkAndInstallEspDeviceDriver() &&
         await _checkAndInstallPython() &&
         await _checkAndInstallEsptool() &&
         await _checkAndInstallFrp()) {
@@ -166,6 +183,29 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
+  void _setEnvCheckFailureStates() {
+    setState(() {
+      _isEnvChecked = true;
+      _isPythonInstalled = false;
+      _isEnvReady = false;
+      _isInChecking = false;
+    });
+  }
+
+  void _setEnvCheckSuccessStates(int frpcPid, int espRfcServerPid) {
+    setState(() {
+      _isEnvChecked = true;
+      _isEspDeviceDriverInstalled = true;
+      _isPythonInstalled = true;
+      _isEsptoolInstalled = true;
+      _isFrpInstalled = true;
+      _frpcPid = frpcPid;
+      _espRfcServerPid = espRfcServerPid;
+      _isEnvReady = true;
+      _isInChecking = false;
+    });
+  }
+
   void _checkFlashingEnv() async {
     _resetChecking();
     setState(() {
@@ -177,26 +217,30 @@ class _MyHomePageState extends State<MyHomePage> {
       if (userDir != null) {
         _envDir = path.join(userDir, _envDirName);
         if (await CommonUtils.checkFileOrDirectory(path: _envDir) &&
+            await CommonUtils.checkEspDeviceDriverInstallation(
+                baseDir: _envDir) &&
             await CommonUtils.checkPythonInstallation(baseDir: _envDir) &&
             await CommonUtils.checkEsptoolInstallation(baseDir: _envDir) &&
-            await CommonUtils.checkFrpInstallation(baseDir: _envDir) &&
-            await CommonUtils.startFrpc(baseDir: _envDir)) {
-          setState(() {
-            _isEnvChecked = true;
-            _isPythonInstalled = true;
-            _isEnvReady = true;
-            _isInChecking = false;
-          });
+            await CommonUtils.checkFrpInstallation(baseDir: _envDir)) {
+          // All components are installed,
+          // then start the frpc and esp rfc server services.
+          //final frpcServiceStatus =
+          //    await CommonUtils.startFrpc(baseDir: _envDir!);
+          //if (frpcServiceStatus == null || frpcServiceStatus.pid == null) {
+          //  // Failed to start frpc.
+          //  // TODO: notify user the failure.
+          //}
+
+          // Here the frpc is started successfully,
+          // then start the esp rfc server.
+          //final espRfcServiceStatus =
+
+          _setEnvCheckSuccessStates(-1, -2);
           return;
         }
       }
 
-      setState(() {
-        _isEnvChecked = true;
-        _isPythonInstalled = false;
-        _isEnvReady = false;
-        _isInChecking = false;
-      });
+      _setEnvCheckFailureStates();
     });
 
     return;
