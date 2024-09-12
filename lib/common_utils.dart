@@ -35,13 +35,45 @@ class CommonUtils {
     }
   }
 
+  static Future<bool> checkFileOrDirectory({required String? path}) async {
+    if (path == null) {
+      return false;
+    }
+
+    final entity = await FileSystemEntity.type(path);
+    if (entity == FileSystemEntityType.notFound) {
+      return false;
+    }
+
+    return true;
+  }
+
+  static Future<void> deleteFileOrDirectory({required String? path}) async {
+    if (path == null) {
+      return;
+    }
+
+    final entity = await FileSystemEntity.type(path);
+    if (entity == FileSystemEntityType.notFound) {
+      return;
+    }
+
+    if (entity == FileSystemEntityType.directory) {
+      final dir = Directory(path);
+      await dir.delete(recursive: true);
+    } else {
+      final file = File(path);
+      await file.delete(recursive: true);
+    }
+  }
+
   static Future<String?> createDirectory(
-      String? baseDir, String dirName) async {
+      {required String? baseDir, required String name}) async {
     if (baseDir == null || baseDir.isEmpty) {
       return null;
     }
 
-    final envDirPath = path.join(baseDir, dirName);
+    final envDirPath = path.join(baseDir, name);
     final envDir = Directory(envDirPath);
     if (!(await envDir.exists())) {
       // Create env directory.
@@ -51,26 +83,182 @@ class CommonUtils {
     return envDir.path;
   }
 
-  static Future<bool> checkPythonInstallation() async {
-    try {
-      var result = await Process.run('python', ['--version']);
-      return result.exitCode == 0;
-    } catch (e) {
+  static Future<bool> checkEsptoolInstallation(
+      {required String? baseDir}) async {
+    if (baseDir == null) {
       return false;
     }
+
+    final pythonExecPath = path.join(baseDir, 'python3', 'python.exe');
+    final espRfcServerScriptPath = path.join(
+        baseDir, 'esptool', 'esptool-master', 'esp_rfc2217_server.py');
+    final file = File(espRfcServerScriptPath);
+    if (!(await file.exists())) {
+      return false;
+    }
+
+    return await _runProcess(pythonExecPath, [espRfcServerScriptPath, '-h']);
+  }
+
+  static Future<bool> checkFrpInstallation({required String? baseDir}) async {
+    if (baseDir == null) {
+      return false;
+    }
+
+    final file =
+        File(path.join(baseDir, 'frp', 'frp_0.60.0_windows_amd64', 'frpc.exe'));
+    if (!(await file.exists())) {
+      return false;
+    }
+
+    return await _runProcess(file.path, ['--version']);
+  }
+
+  static Future<bool> checkPythonInstallation(
+      {required String? baseDir}) async {
+    if (baseDir == null) {
+      return false;
+    }
+
+    final file = File(path.join(baseDir, 'python3', 'python.exe'));
+    if (!(await file.exists())) {
+      return false;
+    }
+
+    return await _runProcess(file.path, ['--version']);
+  }
+
+  ///
+  /// Return the esptool directory.
+  ///
+  static Future<String?> installEsptool({required String baseDir}) async {
+    final targetDir = await createDirectory(baseDir: baseDir, name: 'esptool');
+    if (targetDir == null) {
+      return null;
+    }
+
+    if (await checkEsptoolInstallation(baseDir: baseDir)) {
+      return targetDir;
+    }
+
+    // TODO: Download from genesis backend.
+    const downloadUrl =
+        'https://github.com/espressif/esptool/archive/refs/heads/master.zip';
+    if (!(await downloadFile(downloadUrl, baseDir, 'esptool.zip'))) {
+      return null;
+    }
+
+    // Create unzipped directory and Unzip.
+    final sourceZipFilePath = path.join(baseDir, 'esptool.zip');
+    if (!(await unzipFile(sourceZipFilePath, targetDir))) {
+      return null;
+    }
+    // Delete the zip file.
+    await deleteFileOrDirectory(path: sourceZipFilePath);
+
+    // Install esptool requirements.
+    final pythonExecPath = path.join(baseDir, 'python3', 'python.exe');
+    final esptoolBaseDir = path.join(baseDir, 'esptool', 'esptool-master');
+    final setupScriptPath = path.join(esptoolBaseDir, 'setup.py');
+    if (!(await _runProcess(pythonExecPath, [setupScriptPath, 'install'],
+        workingDir: esptoolBaseDir))) {
+      return null;
+    }
+
+    // Ensure the esp rfc server is available.
+    final espRfcServerScriptPath = path.join(
+        baseDir, 'esptool', 'esptool-master', 'esp_rfc2217_server.py');
+    if (!(await _runProcess(pythonExecPath, [espRfcServerScriptPath, '-h']))) {
+      return null;
+    }
+
+    return targetDir;
+  }
+
+  static Future<bool> startFrpc({required String baseDir}) async {
+    if (!(await checkFrpInstallation(baseDir: baseDir))) {
+      return false;
+    }
+
+    final frpcPath =
+        path.join(baseDir, 'frp', 'frp_0.60.0_windows_amd64', 'frpc.exe');
+    final frpcConfigFilePath =
+        path.join(baseDir, 'frp', 'frp_0.60.0_windows_amd64', 'frpc.toml');
+    if (!(await _runProcess(frpcPath, ['-c', frpcConfigFilePath]))) {
+      return false;
+    }
+
+    return true;
+  }
+
+  ///
+  /// Return the frp directory.
+  ///
+  static Future<String?> installFrp(
+      {required CpuArch cpuArch, required String baseDir}) async {
+    final targetDir = await createDirectory(baseDir: baseDir, name: 'frp');
+    if (targetDir == null) {
+      return null;
+    }
+
+    if (await checkFrpInstallation(baseDir: baseDir)) {
+      return targetDir;
+    }
+
+    // Download frp from official site.
+    // TODO: Download from genesis backend.
+    var downloadUrl =
+        'https://github.com/fatedier/frp/releases/download/v0.60.0/';
+    switch (cpuArch) {
+      case CpuArch.amd64:
+        downloadUrl += 'frp_0.60.0_windows_amd64.zip';
+        break;
+      case CpuArch.arm64:
+        downloadUrl += 'frp_0.60.0_windows_arm64.zip';
+        break;
+      default:
+        return null;
+    }
+
+    if (!(await downloadFile(downloadUrl, baseDir, 'frp.zip'))) {
+      return null;
+    }
+
+    // Create unzipped directory and Unzip.
+    final sourceZipFilePath = path.join(baseDir, 'frp.zip');
+    if (!(await unzipFile(sourceZipFilePath, targetDir))) {
+      return null;
+    }
+    // Delete the zip file.
+    await deleteFileOrDirectory(path: sourceZipFilePath);
+
+    // Ensure frp is available.
+    if (!(await _runProcess(
+        path.join(targetDir, 'frp_0.60.0_windows_amd64', 'frpc.exe'),
+        ['--version']))) {
+      return null;
+    }
+
+    return targetDir;
   }
 
   ///
   /// Return the python directory.
   ///
-  static Future<String?> installPython(CpuArch cpuArch, String baseDir) async {
-    if (await checkPythonInstallation()) {
+  static Future<String?> installPython(
+      {required CpuArch cpuArch, required String baseDir}) async {
+    final targetDir = await createDirectory(baseDir: baseDir, name: 'python3');
+    if (targetDir == null) {
       return null;
+    }
+
+    if (await checkPythonInstallation(baseDir: baseDir)) {
+      return targetDir;
     }
 
     // Download python3 from official site.
     // TODO: Download from genesis backend.
-    String downloadUrl = 'https://www.python.org/ftp/python/3.12.6/';
+    var downloadUrl = 'https://www.python.org/ftp/python/3.12.6/';
     switch (cpuArch) {
       case CpuArch.amd:
         downloadUrl += 'python-3.12.6-embed-win32.zip';
@@ -85,20 +273,48 @@ class CommonUtils {
         return null;
     }
 
-    final result = await downloadFile(downloadUrl, baseDir, 'python3.zip');
-    if (!result) {
+    if (!(await downloadFile(downloadUrl, baseDir, 'python3.zip'))) {
       return null;
     }
 
     // Create unzipped directory and Unzip.
-    final targetDir = await createDirectory(baseDir, 'python3');
-    if (targetDir == null) {
+    final sourceZipFilePath = path.join(baseDir, 'python3.zip');
+    if (!(await unzipFile(sourceZipFilePath, targetDir))) {
       return null;
     }
-    final isUnzipped =
-        await unzipFile(path.join(baseDir, 'python3.zip'), targetDir);
+    // Delete the zip file.
+    await deleteFileOrDirectory(path: sourceZipFilePath);
 
-    return isUnzipped ? targetDir : null;
+    // Modify python312._pth, add a line of 'import site'.
+    final pthFile = File(path.join(targetDir, 'python312._pth'));
+    if (!(await pthFile.exists())) {
+      return null;
+    }
+    await pthFile.writeAsString('import site', mode: FileMode.append);
+
+    // Before installation, the setup_pip.py should be downloaded first.
+    const setupPipScriptUrl = 'https://bootstrap.pypa.io/get-pip.py';
+    if (!(await downloadFile(setupPipScriptUrl, baseDir, 'get_pip.py'))) {
+      return null;
+    }
+    // Install pip.
+    if (!(await _runProcess(path.join(targetDir, 'python.exe'),
+        [path.join(baseDir, 'get_pip.py')]))) {
+      return null;
+    }
+    // Ensure the pip is available.
+    if (!(await _runProcess(
+        path.join(targetDir, 'python.exe'), ['-m', 'pip', '--version']))) {
+      return null;
+    }
+
+    // Install Setuptools.
+    if (!(await _runProcess(path.join(targetDir, 'python.exe'),
+        ['-m', 'pip', 'install', 'setuptools']))) {
+      return null;
+    }
+
+    return targetDir;
   }
 
   static Future<bool> downloadFile(
@@ -147,6 +363,18 @@ class CommonUtils {
       }
 
       return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> _runProcess(String command, List<String> args,
+      {String? workingDir}) async {
+    try {
+      var result = workingDir == null
+          ? await Process.run(command, args)
+          : await Process.run(command, args, workingDirectory: workingDir);
+      return result.exitCode == 0;
     } catch (e) {
       return false;
     }

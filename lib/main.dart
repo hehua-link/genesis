@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:genesis/common_utils.dart';
+import 'package:path/path.dart' as path;
 
 void main() {
   runApp(const MyApp());
@@ -44,7 +45,14 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _isCpuArchSupported = true;
   bool _isEnvDirCreated = true;
   bool _isPythonInstalled = true;
+  bool _isEsptoolInstalled = true;
   bool _isFrpInstalled = true;
+
+  CpuArch _cpuArch = CpuArch.unknown;
+
+  String? _pythonInstallDir;
+  String? _esptoolInstallDir;
+  String? _frpInstallDir;
 
   bool _isEnvCreationStarted = false;
 
@@ -66,7 +74,8 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<bool> _checkAndCreateEnvDirectory() async {
     // Get current user directory.
     final userDir = Platform.environment['USERPROFILE'];
-    final envDir = await CommonUtils.createDirectory(userDir, _envDirName);
+    final envDir =
+        await CommonUtils.createDirectory(baseDir: userDir, name: _envDirName);
     setState(() {
       _isEnvDirCreated = envDir != null;
       _envDir = envDir;
@@ -84,9 +93,12 @@ class _MyHomePageState extends State<MyHomePage> {
   ///
   bool _checkCpuArch() {
     final cpuArch = CommonUtils.checkCpuArch();
-    final supported = cpuArch != CpuArch.unknown && cpuArch != CpuArch.arm;
+    final supported = cpuArch != CpuArch.unknown &&
+        cpuArch != CpuArch.arm &&
+        cpuArch != CpuArch.amd;
     setState(() {
       _isCpuArchSupported = supported;
+      _cpuArch = cpuArch;
     });
 
     return supported;
@@ -96,15 +108,39 @@ class _MyHomePageState extends State<MyHomePage> {
   /// Check whether python3 is installed, if not execute installation.
   ///
   Future<bool> _checkAndInstallPython() async {
-    // Check whether python3 is installed.
-    final isInstalled = await _checkPythonInstallation();
+    String? installPath =
+        await CommonUtils.installPython(cpuArch: _cpuArch, baseDir: _envDir!);
     setState(() {
-      _isPythonInstalled = isInstalled;
+      _isPythonInstalled = installPath != null;
+      _pythonInstallDir = installPath;
     });
 
-    if (!isInstalled) {
-      // Install python3.
-    }
+    return installPath != null;
+  }
+
+  Future<bool> _checkAndInstallEsptool() async {
+    String? installPath = await CommonUtils.installEsptool(baseDir: _envDir!);
+    setState(() {
+      _isEsptoolInstalled = installPath != null;
+      _esptoolInstallDir = installPath;
+    });
+
+    return installPath != null;
+  }
+
+  Future<bool> _checkAndInstallFrp() async {
+    String? installPath =
+        await CommonUtils.installFrp(cpuArch: _cpuArch, baseDir: _envDir!);
+    setState(() {
+      _isFrpInstalled = installPath != null;
+      _frpInstallDir = installPath;
+    });
+
+    return installPath != null;
+  }
+
+  _cleanEnv() async {
+    CommonUtils.deleteFileOrDirectory(path: _envDir);
   }
 
   _startEnvCreation() async {
@@ -112,10 +148,17 @@ class _MyHomePageState extends State<MyHomePage> {
       _isEnvCreationStarted = true;
     });
 
-    if (_checkCpuArch() && await _checkAndCreateEnvDirectory()) {
+    if (_checkCpuArch() &&
+        await _checkAndCreateEnvDirectory() &&
+        await _checkAndInstallPython() &&
+        await _checkAndInstallEsptool() &&
+        await _checkAndInstallFrp()) {
       setState(() {
         _isEnvReady = true;
       });
+    } else {
+      // The env creation failed, just clean the incomplete env directory.
+      _cleanEnv();
     }
 
     setState(() {
@@ -130,18 +173,28 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     Future.delayed(const Duration(seconds: 3), () async {
-      var result = await CommonUtils.checkPythonInstallation();
-      if (!result) {
-        setState(() {
-          _isEnvChecked = true;
-          _isPythonInstalled = false;
-          _isEnvReady = false;
-        });
-      } else {
-        // TODO
+      final userDir = Platform.environment['USERPROFILE'];
+      if (userDir != null) {
+        _envDir = path.join(userDir, _envDirName);
+        if (await CommonUtils.checkFileOrDirectory(path: _envDir) &&
+            await CommonUtils.checkPythonInstallation(baseDir: _envDir) &&
+            await CommonUtils.checkEsptoolInstallation(baseDir: _envDir) &&
+            await CommonUtils.checkFrpInstallation(baseDir: _envDir) &&
+            await CommonUtils.startFrpc(baseDir: _envDir)) {
+          setState(() {
+            _isEnvChecked = true;
+            _isPythonInstalled = true;
+            _isEnvReady = true;
+            _isInChecking = false;
+          });
+          return;
+        }
       }
 
       setState(() {
+        _isEnvChecked = true;
+        _isPythonInstalled = false;
+        _isEnvReady = false;
         _isInChecking = false;
       });
     });
